@@ -1,0 +1,147 @@
+name: GPU Simulator
+
+# Optional, non-required check. The hosted runners have no GPU, so the CUDA
+# builds in CIBuild.yml are compile-only and CIValidations.yml runs in the CPU
+# image. This builds MaCh3 with CUDA against MaCh3Tutorial, as CIValidations.yml
+# does, and runs the validations on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behavior or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [ develop ]
+    paths:
+      - "Splines/**"
+      - "Samples/**"
+      - "Parameters/**"
+      - "Fitters/**"
+      - "Manager/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validations:
+    name: CUDA validations on simulated H100
+    runs-on: ubuntu-24.04
+    # The ROOT image Doc/MaCh3DockerFiles/Ubuntu22.04 starts from, on Ubuntu
+    # 24.04 so that the simulator action can install CUDA 13.0 with apt.
+    container: rootproject/root:6.32.02-ubuntu24.04
+    timeout-minutes: 180
+    defaults:
+      run:
+        shell: bash
+    env:
+      OMP_NUM_THREADS: 4
+      # NuMCMCTools' requirements are pip-installed into the image's Python.
+      PIP_BREAK_SYSTEM_PACKAGES: 1
+      PIP_IGNORE_INSTALLED: 1
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            nlohmann-json3-dev cmake ninja-build git ca-certificates curl python3-dev python3-pip
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@ab71a07326835be678918901c340d53a83358067 # v0.1.6
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+
+      # CPM_MaCh3_SOURCE builds MaCh3 from this checkout, so it also works for
+      # pull requests from forks. CUDA architecture 90 embeds sm_90 code and
+      # compute_90 PTX; the simulator runs the PTX. A PTX-only build
+      # (90-virtual) does not work: each CUDA library then exports the same
+      # __cudaRegisterLinkedBinary symbol from libcudadevrt, and only the first
+      # library loaded registers its kernels. The simulator needs the shared
+      # CUDA runtime.
+      - name: Configure
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git clone --depth 1 https://github.com/mach3-software/MaCh3Tutorial.git /opt/MaCh3Validations
+          mkdir /opt/MaCh3Validations/build
+          cd /opt/MaCh3Validations/build
+          cmake ../ \
+            -DMaCh3_Branch=develop \
+            -DCPM_MaCh3_SOURCE="$GITHUB_WORKSPACE" \
+            -DMaCh3_PREFIX="$GITHUB_WORKSPACE" \
+            -DMaCh3Tutorial_UNITTESTS_ENABLED=TRUE \
+            -DCMAKE_CUDA_ARCHITECTURES=90 \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+
+      - name: Build
+        working-directory: /opt/MaCh3Validations/build
+        run: make -j3 install
+
+      # The steps of MaCh3CLI --ReweightValidations and --CovarianceValidations
+      # that pass on a real GPU. Left out:
+      # - SamplePDFValidations: BinnedSplineHandler::PrepareMonolithDir throws on
+      #   any GPU build ("manycoeff_arr is nullptr"), also on a real GPU.
+      # - LLHValidation and SigmaVarValidation: the GPU spline path is single
+      #   precision, so the printed values differ from the CPU reference files
+      #   in the 7th to 8th significant digit, also on a real GPU.
+      # - PredictiveValidations: fails on the simulator only (it returns an
+      #   error for cudaDestroyTextureObject(0), which a real GPU accepts).
+      - name: Reweight and Covariance validations
+        working-directory: /opt/MaCh3Validations/build
+        run: |
+          source bin/setup.MaCh3.sh
+          source bin/setup.MaCh3Tutorial.sh
+          cd "$MaCh3Tutorial_ROOT"
+          set -x
+          vgpu run CIValidations/SplineValidations
+          vgpu run bin/KinemDistributionTutorial TutorialConfigs/FitterConfig.yaml
+          vgpu run CIValidations/NuOscillatorInterfaceValidations
+          vgpu run CIValidations/BinningValidations
+          vgpu run CIValidations/SplinePlotting/SplinePlotting
+          vgpu run CIValidations/CovarianceValidations
+          vgpu run CIValidations/MaCh3ModeValidations
+          vgpu run CIValidations/UnitTests/manager_tests
+          vgpu run CIValidations/UnitTests/histogram_tests
+          vgpu run CIValidations/UnitTests/statistical_tests
+          vgpu run CIValidations/UnitTests/binning_parser_tests
+          vgpu run bin/LLHScanTutorial TutorialConfigs/FitterConfig.yaml
+          vgpu run "$MaCh3_ROOT/bin/PlotLLH" LLH_Test.root -s -g -l "blarb.root"
+
+      - name: Fitter validations
+        working-directory: /opt/MaCh3Validations/build
+        run: |
+          source bin/setup.MaCh3.sh
+          source bin/setup.MaCh3Tutorial.sh
+          vgpu run MaCh3CLI --FitterValidations
+
+      - name: Multi Canonical validations
+        working-directory: /opt/MaCh3Validations/build
+        run: |
+          source bin/setup.MaCh3.sh
+          source bin/setup.MaCh3Tutorial.sh
+          vgpu run MaCh3CLI --MultiCanonicalValidations
+
+      - name: MaCh3 CLI validations
+        working-directory: /opt/MaCh3Validations/build
+        run: |
+          source bin/setup.MaCh3.sh
+          source bin/setup.MaCh3Tutorial.sh
+          vgpu run MaCh3CLI --CLIValidations
+
+      - name: NuMCMC Tools validations
+        working-directory: /opt/MaCh3Validations/build
+        run: |
+          source bin/setup.MaCh3.sh
+          source bin/setup.MaCh3Tutorial.sh
+          vgpu run MaCh3CLI --NuMCMCToolsValidations
